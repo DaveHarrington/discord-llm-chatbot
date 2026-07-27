@@ -361,7 +361,7 @@ async def on_message(new_msg: discord.Message) -> None:
                         for tc in choice.delta.tool_calls:
                             idx = tc.index
                             if idx not in tool_calls_buf:
-                                tool_calls_buf[idx] = {"id": f"mcp_tool_call_{idx}", "name": "", "arguments": ""}
+                                tool_calls_buf[idx] = {"id": None, "name": "", "arguments": ""}
                             if tc.id:
                                 tool_calls_buf[idx]["id"] = tc.id
                             if tc.function:
@@ -370,8 +370,10 @@ async def on_message(new_msg: discord.Message) -> None:
                                     # ("get_post") or partial chunks ("get_" + "post").
                                     incoming_name = tc.function.name
                                     current_name = tool_calls_buf[idx]["name"]
+                                    # Prefix replacement: move from partial to full (get_ -> get_post).
                                     if not current_name or incoming_name.startswith(current_name):
                                         tool_calls_buf[idx]["name"] = incoming_name
+                                    # Concatenation fallback: append non-overlapping fragments.
                                     elif current_name != incoming_name and not current_name.endswith(incoming_name):
                                         tool_calls_buf[idx]["name"] += incoming_name
                                 if tc.function.arguments:
@@ -421,7 +423,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     tool_call_iterations += 1
                     tool_calls_list = [
                         {
-                            "id": tool_calls_buf[idx]["id"],
+                            "id": tool_calls_buf[idx]["id"] or f"mcp_tool_call_{tool_call_iterations}_{idx}",
                             "type": "function",
                             "function": {
                                 "name": tool_calls_buf[idx]["name"],
@@ -449,10 +451,14 @@ async def on_message(new_msg: discord.Message) -> None:
                     tool_results = await asyncio.gather(*[_execute_tool(tc) for tc in tool_calls_list])
 
                     for tc, result in zip(tool_calls_list, tool_results):
-                        result_len = len(result or "")
-                        logging.info(f"MCP tool '{tc['function']['name']}' completed (chars={result_len})")
-                        logging.debug(f"MCP tool '{tc['function']['name']}' result preview: {result[:200]}")
-                        completion_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                        if result is None:
+                            logging.info(f"MCP tool '{tc['function']['name']}' completed with no result")
+                            tool_content = ""
+                        else:
+                            logging.info(f"MCP tool '{tc['function']['name']}' completed (chars={len(result)})")
+                            logging.debug(f"MCP tool '{tc['function']['name']}' result preview: {result[:200]}")
+                            tool_content = result
+                        completion_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_content})
 
                     continue  # Re-enter the loop with tool results appended
 
