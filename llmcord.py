@@ -338,6 +338,7 @@ async def on_message(new_msg: discord.Message) -> None:
     try:
         async with new_msg.channel.typing():
             tool_call_iterations = 0
+            fallback_tool_call_id_counter = 0
             max_tool_iterations = 10
             while tool_call_iterations < max_tool_iterations:  # Agentic tool-call loop: repeat until no more tool calls
                 tool_calls_buf: dict[int, dict] = {}
@@ -366,16 +367,7 @@ async def on_message(new_msg: discord.Message) -> None:
                                 tool_calls_buf[idx]["id"] = tc.id
                             if tc.function:
                                 if tc.function.name:
-                                    # Some providers stream tool names as either full replacements
-                                    # ("get_post") or partial chunks ("get_" + "post").
-                                    incoming_name = tc.function.name
-                                    current_name = tool_calls_buf[idx]["name"]
-                                    # Prefix replacement: move from partial to full (get_ -> get_post).
-                                    if not current_name or incoming_name.startswith(current_name):
-                                        tool_calls_buf[idx]["name"] = incoming_name
-                                    # Concatenation fallback: append non-overlapping fragments.
-                                    elif current_name != incoming_name and not current_name.endswith(incoming_name):
-                                        tool_calls_buf[idx]["name"] += incoming_name
+                                    tool_calls_buf[idx]["name"] = tc.function.name
                                 if tc.function.arguments:
                                     tool_calls_buf[idx]["arguments"] += tc.function.arguments
                         continue
@@ -421,17 +413,20 @@ async def on_message(new_msg: discord.Message) -> None:
                 # If the model requested tool calls, execute them and loop again
                 if tool_calls_buf:
                     tool_call_iterations += 1
-                    tool_calls_list = [
-                        {
-                            "id": tool_calls_buf[idx]["id"] or f"mcp_tool_call_{tool_call_iterations}_{idx}",
+                    tool_calls_list = []
+                    for idx in sorted(tool_calls_buf.keys()):
+                        tool_call_id = tool_calls_buf[idx]["id"]
+                        if not tool_call_id:
+                            tool_call_id = f"mcp_tool_call_{fallback_tool_call_id_counter}"
+                            fallback_tool_call_id_counter += 1
+                        tool_calls_list.append({
+                            "id": tool_call_id,
                             "type": "function",
                             "function": {
                                 "name": tool_calls_buf[idx]["name"],
                                 "arguments": tool_calls_buf[idx]["arguments"],
                             },
-                        }
-                        for idx in sorted(tool_calls_buf.keys())
-                    ]
+                        })
 
                     completion_messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_list})
 
