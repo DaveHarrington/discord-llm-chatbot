@@ -359,15 +359,26 @@ async def on_message(new_msg: discord.Message) -> None:
 
                     # Accumulate tool-call deltas (no text output for these chunks)
                     if choice.delta.tool_calls:
+                        def _merge_streamed_tool_name(current_name: str, incoming_name: str) -> str:
+                            if not current_name or incoming_name.startswith(current_name):
+                                return incoming_name
+                            if current_name.endswith(incoming_name):
+                                return current_name
+                            max_overlap = min(len(current_name), len(incoming_name))
+                            for i in range(max_overlap, 0, -1):
+                                if current_name.endswith(incoming_name[:i]):
+                                    return current_name + incoming_name[i:]
+                            return current_name + incoming_name
+
                         for tc in choice.delta.tool_calls:
                             idx = tc.index
                             if idx not in tool_calls_buf:
-                                tool_calls_buf[idx] = {"id": None, "name": "", "arguments": ""}
+                                tool_calls_buf[idx] = {"id": "", "name": "", "arguments": ""}
                             if tc.id:
                                 tool_calls_buf[idx]["id"] = tc.id
                             if tc.function:
                                 if tc.function.name:
-                                    tool_calls_buf[idx]["name"] = tc.function.name
+                                    tool_calls_buf[idx]["name"] = _merge_streamed_tool_name(tool_calls_buf[idx]["name"], tc.function.name)
                                 if tc.function.arguments:
                                     tool_calls_buf[idx]["arguments"] += tc.function.arguments
                         continue
@@ -417,7 +428,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     for idx in sorted(tool_calls_buf.keys()):
                         tool_call_id = tool_calls_buf[idx]["id"]
                         if not tool_call_id:
-                            tool_call_id = f"fallback_mcp_tool_call_{fallback_tool_call_id_counter}"
+                            tool_call_id = f"fallback_mcp_tool_call_{new_msg.id}_{fallback_tool_call_id_counter}"
                             fallback_tool_call_id_counter += 1
                         tool_calls_list.append({
                             "id": tool_call_id,
