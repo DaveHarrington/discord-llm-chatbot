@@ -417,7 +417,7 @@ async def on_message(new_msg: discord.Message) -> None:
                     for idx in sorted(tool_calls_buf.keys()):
                         tool_call_id = tool_calls_buf[idx]["id"]
                         if not tool_call_id:
-                            tool_call_id = f"mcp_tool_call_{fallback_tool_call_id_counter}"
+                            tool_call_id = f"fallback_mcp_tool_call_{fallback_tool_call_id_counter}"
                             fallback_tool_call_id_counter += 1
                         tool_calls_list.append({
                             "id": tool_call_id,
