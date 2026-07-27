@@ -361,11 +361,13 @@ async def on_message(new_msg: discord.Message) -> None:
                         for tc in choice.delta.tool_calls:
                             idx = tc.index
                             if idx not in tool_calls_buf:
-                                tool_calls_buf[idx] = {"id": f"mcp_tool_call_{tool_call_iterations}_{idx}", "name": "", "arguments": ""}
+                                tool_calls_buf[idx] = {"id": f"mcp_tool_call_{idx}", "name": "", "arguments": ""}
                             if tc.id:
                                 tool_calls_buf[idx]["id"] = tc.id
                             if tc.function:
                                 if tc.function.name:
+                                    # Some providers stream tool names as either full replacements
+                                    # ("get_post") or partial chunks ("get_" + "post").
                                     incoming_name = tc.function.name
                                     current_name = tool_calls_buf[idx]["name"]
                                     if not current_name or incoming_name.startswith(current_name):
