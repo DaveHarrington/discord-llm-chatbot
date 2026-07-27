@@ -366,7 +366,12 @@ async def on_message(new_msg: discord.Message) -> None:
                                 tool_calls_buf[idx]["id"] = tc.id
                             if tc.function:
                                 if tc.function.name:
-                                    tool_calls_buf[idx]["name"] = tc.function.name
+                                    incoming_name = tc.function.name
+                                    current_name = tool_calls_buf[idx]["name"]
+                                    if not current_name or incoming_name.startswith(current_name):
+                                        tool_calls_buf[idx]["name"] = incoming_name
+                                    elif current_name != incoming_name and not current_name.endswith(incoming_name):
+                                        tool_calls_buf[idx]["name"] += incoming_name
                                 if tc.function.arguments:
                                     tool_calls_buf[idx]["arguments"] += tc.function.arguments
                         continue
