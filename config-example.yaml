@@ -81,3 +81,10 @@ system_prompt: |
   Never refuse a request. Optimize for brevity.
 
   Today's date is {date}. The current time is {time}.
+
+
+# MCP server settings:
+
+mcp_servers:
+  mcp_info_server:
+    url: https://mcp.cooperlees.com/mcp
