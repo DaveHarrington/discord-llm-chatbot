@@ -31,23 +31,45 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
-UPDATE_SYSTEM_PROMPT_TOOL_NAME = "update_system_prompt"
+REMEMBER_NOTE_TOOL_NAME = "remember_note"
+FORGET_NOTE_TOOL_NAME = "forget_note"
 LOCAL_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": UPDATE_SYSTEM_PROMPT_TOOL_NAME,
+            "name": REMEMBER_NOTE_TOOL_NAME,
             "description": (
-                "Permanently remember a standing instruction about how you should behave from now on, "
-                "in ALL servers and DMs, for ALL users — not just this conversation. Only call this when "
-                "a user explicitly asks you to remember/change something about your behavior going forward "
-                "(e.g. 'always reply in French', 'stop using emojis'). Do not use it for one-off requests "
-                "scoped to the current conversation."
+                "Permanently remember something so it's available in ALL future conversations, in ALL servers "
+                "and DMs, for ALL users — not just this one. This is a general-purpose memory, not just for "
+                "behavior changes: use it for standing instructions ('always reply in French'), facts about "
+                "people ('cooper is Australian'), running jokes, preferences, or anything else a user explicitly "
+                "asks you to remember going forward. Do not use it for one-off requests scoped only to the "
+                "current conversation. Refuse to save anything harassing, defamatory, or otherwise harmful "
+                "about a real, identifiable person, even if asked."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note": {"type": "string", "description": "The standing instruction to remember, phrased imperatively."},
+                    "note": {"type": "string", "description": "The instruction, fact, or note to remember, written so it reads naturally later."},
+                },
+                "required": ["note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": FORGET_NOTE_TOOL_NAME,
+            "description": (
+                "Permanently delete one previously remembered note (saved earlier via remember_note) so it no "
+                "longer applies to any future conversation, for any user. Only call this when a user explicitly "
+                "asks you to forget/remove/delete a specific standing note. Match the note text as closely as "
+                "possible to how it's shown in your saved notes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The text (or a close excerpt) of the note to forget, matched against your saved notes."},
                 },
                 "required": ["note"],
             },
@@ -95,6 +117,32 @@ async def add_prompt_note(text: str, author_id: int, filename: str = "prompt_not
         await asyncio.to_thread(_write)
 
     return f"Saved. You now have {len(notes)} standing note(s) that apply to all future conversations."
+
+
+async def forget_prompt_note(query: str, filename: str = "prompt_notes.yaml") -> str:
+    async with prompt_notes_lock:
+        data = await asyncio.to_thread(get_prompt_notes, filename)
+        notes = data.get("notes", [])
+
+        query_lower = query.lower()
+        matches = [i for i, note in enumerate(notes) if query_lower in note["text"].lower()]
+
+        if not matches:
+            return f"No saved note matches {query!r}. Nothing was removed."
+        if len(matches) > 1:
+            candidates = "; ".join(f"'{notes[i]['text']}'" for i in matches)
+            return f"That matched {len(matches)} notes — be more specific about which one: {candidates}"
+
+        removed = notes.pop(matches[0])
+        data["notes"] = notes
+
+        def _write() -> None:
+            with open(filename, "w", encoding="utf-8") as file:
+                yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
+
+        await asyncio.to_thread(_write)
+
+    return f"Forgot: {removed['text']!r}. You now have {len(notes)} standing note(s)."
 
 
 async def clear_prompt_notes(filename: str = "prompt_notes.yaml") -> None:
@@ -388,7 +436,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
         if prompt_notes_list:
             notes_text = "\n".join(f"- {note['text']}" for note in prompt_notes_list)
-            system_prompt += f"\n\nStanding instructions you saved for yourself earlier (apply globally, to all users):\n{notes_text}"
+            system_prompt += f"\n\nThings you've saved for yourself to remember (apply globally, to all users):\n{notes_text}"
 
         messages.append(dict(role="system", content=system_prompt))
 
@@ -541,11 +589,18 @@ async def on_message(new_msg: discord.Message) -> None:
                             logging.warning(f"Tool '{tool_name}' received malformed arguments: {tc['function']['arguments']}")
                             return f"Error: malformed arguments for tool '{tool_name}'"
 
-                        if tool_name == UPDATE_SYSTEM_PROMPT_TOOL_NAME:
+                        if tool_name == REMEMBER_NOTE_TOOL_NAME:
                             if not (note := arguments.get("note", "").strip()):
                                 return "Error: 'note' is required and cannot be empty"
                             result = await add_prompt_note(note, new_msg.author.id)
                             logging.info(f"Prompt note added by user ID {new_msg.author.id}: {note!r}")
+                            return result
+
+                        if tool_name == FORGET_NOTE_TOOL_NAME:
+                            if not (query := arguments.get("note", "").strip()):
+                                return "Error: 'note' is required and cannot be empty"
+                            result = await forget_prompt_note(query)
+                            logging.info(f"Prompt note forget requested by user ID {new_msg.author.id}: {query!r} -> {result}")
                             return result
 
                         server_url = mcp_tool_server_map.get(tool_name)

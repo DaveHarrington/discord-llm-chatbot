@@ -82,9 +82,9 @@ system_prompt: |
 
   Today's date is {date}. The current time is {time}.
 
-# Lets the bot save standing behavioral notes for itself (via the update_system_prompt tool)
-# when a user asks it to remember something permanently. Notes persist in prompt_notes.yaml
-# and apply globally, across restarts. Manage them with /promptnotes view|clear.
+# Lets the bot permanently remember things for itself (via the remember_note tool) when a user
+# asks it to — standing instructions, facts about people, running jokes, etc. Notes persist in
+# prompt_notes.yaml and apply globally, across restarts. Manage them with /promptnotes view|clear.
 enable_prompt_notes: true
 max_prompt_notes: 50
 
