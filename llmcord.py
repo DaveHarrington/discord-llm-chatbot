@@ -31,10 +31,64 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+REMEMBER_NOTE_TOOL_NAME = "remember_note"
+FORGET_NOTE_TOOL_NAME = "forget_note"
+LOCAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": REMEMBER_NOTE_TOOL_NAME,
+            "description": (
+                "Permanently remember something so it's available in ALL future conversations, in ALL servers "
+                "and DMs, for ALL users — not just this one. This is a general-purpose memory, not just for "
+                "behavior changes: use it for standing instructions ('always reply in French'), facts about "
+                "people ('cooper is Australian'), running jokes, preferences, or anything else a user explicitly "
+                "asks you to remember going forward. Do not use it for one-off requests scoped only to the "
+                "current conversation. Refuse to save anything harassing, defamatory, or otherwise harmful "
+                "about a real, identifiable person, even if asked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The instruction, fact, or note to remember, written so it reads naturally later."},
+                },
+                "required": ["note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": FORGET_NOTE_TOOL_NAME,
+            "description": (
+                "Permanently delete one previously remembered note (saved earlier via remember_note) so it no "
+                "longer applies to any future conversation, for any user. Only call this when a user explicitly "
+                "asks you to forget/remove/delete a specific standing note. Match the note text as closely as "
+                "possible to how it's shown in your saved notes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The text (or a close excerpt) of the note to forget, matched against your saved notes."},
+                },
+                "required": ["note"],
+            },
+        },
+    },
+]
+
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
         return yaml.safe_load(file)
+
+
+def get_prompt_notes(filename: str = "prompt_notes.yaml") -> dict[str, Any]:
+    try:
+        with open(filename, encoding="utf-8") as file:
+            return yaml.safe_load(file) or {"notes": []}
+    except FileNotFoundError:
+        return {"notes": []}
 
 
 config = get_config()
@@ -42,6 +96,63 @@ curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+
+prompt_notes_lock = asyncio.Lock()
+
+
+async def add_prompt_note(text: str, author_id: int, filename: str = "prompt_notes.yaml") -> str:
+    async with prompt_notes_lock:
+        data = await asyncio.to_thread(get_prompt_notes, filename)
+        notes = data.get("notes", [])
+        notes.append({"text": text, "added_by": author_id, "added_at": datetime.now().astimezone().isoformat()})
+
+        max_notes = config.get("max_prompt_notes", 50)
+        notes = notes[-max_notes:]
+        data["notes"] = notes
+
+        def _write() -> None:
+            with open(filename, "w", encoding="utf-8") as file:
+                yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
+
+        await asyncio.to_thread(_write)
+
+    return f"Saved. You now have {len(notes)} standing note(s) that apply to all future conversations."
+
+
+async def forget_prompt_note(query: str, filename: str = "prompt_notes.yaml") -> str:
+    async with prompt_notes_lock:
+        data = await asyncio.to_thread(get_prompt_notes, filename)
+        notes = data.get("notes", [])
+
+        query_lower = query.lower()
+        matches = [i for i, note in enumerate(notes) if query_lower in note["text"].lower()]
+
+        if not matches:
+            return f"No saved note matches {query!r}. Nothing was removed."
+        if len(matches) > 1:
+            candidates = "; ".join(f"'{notes[i]['text']}'" for i in matches)
+            return f"That matched {len(matches)} notes — be more specific about which one: {candidates}"
+
+        removed = notes.pop(matches[0])
+        data["notes"] = notes
+
+        def _write() -> None:
+            with open(filename, "w", encoding="utf-8") as file:
+                yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
+
+        await asyncio.to_thread(_write)
+
+    return f"Forgot: {removed['text']!r}. You now have {len(notes)} standing note(s)."
+
+
+async def clear_prompt_notes(filename: str = "prompt_notes.yaml") -> None:
+    async with prompt_notes_lock:
+        def _write() -> None:
+            with open(filename, "w", encoding="utf-8") as file:
+                yaml.safe_dump({"notes": []}, file, allow_unicode=True, sort_keys=False)
+
+        await asyncio.to_thread(_write)
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -134,6 +245,26 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
 
 
+@discord_bot.tree.command(name="promptnotes", description="View or clear the bot's self-saved standing instructions")
+async def promptnotes_command(interaction: discord.Interaction, action: Literal["view", "clear"] = "view") -> None:
+    if action == "clear":
+        if interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+            await clear_prompt_notes()
+            output = "Cleared all standing notes."
+            logging.info(f"Prompt notes cleared by user ID {interaction.user.id}")
+        else:
+            output = "You don't have permission to clear notes."
+    else:
+        notes = (await asyncio.to_thread(get_prompt_notes)).get("notes", [])
+        if not notes:
+            output = "No standing notes saved."
+        else:
+            lines = [f"- {note['text']} (added by <@{note['added_by']}> at {note['added_at']})" for note in notes]
+            output = "**Standing notes:**\n" + "\n".join(lines)
+
+    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+
+
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     global config
@@ -168,6 +299,7 @@ async def on_message(new_msg: discord.Message) -> None:
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
 
     config = await asyncio.to_thread(get_config)
+    prompt_notes = await asyncio.to_thread(get_prompt_notes)
 
     allow_dms = config.get("allow_dms", True)
 
@@ -294,12 +426,17 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
-    if system_prompt := config["system_prompt"]:
+    prompt_notes_list = prompt_notes.get("notes", [])
+    if (system_prompt := config["system_prompt"]) or prompt_notes_list:
         now = datetime.now().astimezone()
 
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+        system_prompt = (system_prompt or "").replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
         if accept_usernames:
             system_prompt += "\nUser's names are their Discord IDs and should be typed as '<@ID>'."
+
+        if prompt_notes_list:
+            notes_text = "\n".join(f"- {note['text']}" for note in prompt_notes_list)
+            system_prompt += f"\n\nThings you've saved for yourself to remember (apply globally, to all users):\n{notes_text}"
 
         messages.append(dict(role="system", content=system_prompt))
 
@@ -321,6 +458,8 @@ async def on_message(new_msg: discord.Message) -> None:
     mcp_tool_server_map: dict[str, str] = {}
     if mcp_servers:
         mcp_tools_list, mcp_tool_server_map = await fetch_mcp_tools(mcp_servers)
+
+    tools_list = (LOCAL_TOOLS if config.get("enable_prompt_notes", True) else []) + mcp_tools_list
 
     completion_messages = messages[::-1]
     if mcp_tools_list:
@@ -345,8 +484,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 curr_content = finish_reason = None
 
                 kwargs = dict(model=model, messages=completion_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
-                if mcp_tools_list:
-                    kwargs["tools"] = mcp_tools_list
+                if tools_list:
+                    kwargs["tools"] = tools_list
 
                 async for chunk in await openai_client.chat.completions.create(**kwargs):
                     if finish_reason != None:
@@ -443,15 +582,31 @@ async def on_message(new_msg: discord.Message) -> None:
 
                     async def _execute_tool(tc: dict) -> str:
                         tool_name = tc["function"]["name"]
+
+                        try:
+                            arguments = json.loads(tc["function"]["arguments"] or "{}")
+                        except json.JSONDecodeError:
+                            logging.warning(f"Tool '{tool_name}' received malformed arguments: {tc['function']['arguments']}")
+                            return f"Error: malformed arguments for tool '{tool_name}'"
+
+                        if tool_name == REMEMBER_NOTE_TOOL_NAME:
+                            if not (note := arguments.get("note", "").strip()):
+                                return "Error: 'note' is required and cannot be empty"
+                            result = await add_prompt_note(note, new_msg.author.id)
+                            logging.info(f"Prompt note added by user ID {new_msg.author.id}: {note!r}")
+                            return result
+
+                        if tool_name == FORGET_NOTE_TOOL_NAME:
+                            if not (query := arguments.get("note", "").strip()):
+                                return "Error: 'note' is required and cannot be empty"
+                            result = await forget_prompt_note(query)
+                            logging.info(f"Prompt note forget requested by user ID {new_msg.author.id}: {query!r} -> {result}")
+                            return result
+
                         server_url = mcp_tool_server_map.get(tool_name)
                         if not server_url:
                             logging.warning(f"MCP tool '{tool_name}' not found in any configured server")
                             return f"Error: unknown tool '{tool_name}'"
-                        try:
-                            arguments = json.loads(tc["function"]["arguments"] or "{}")
-                        except json.JSONDecodeError:
-                            logging.warning(f"MCP tool '{tool_name}' received malformed arguments: {tc['function']['arguments']}")
-                            return f"Error: malformed arguments for tool '{tool_name}'"
                         return await call_mcp_tool(server_url, tool_name, arguments)
 
                     tool_results = await asyncio.gather(*[_execute_tool(tc) for tc in tool_calls_list])

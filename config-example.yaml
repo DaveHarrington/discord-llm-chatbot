@@ -82,6 +82,12 @@ system_prompt: |
 
   Today's date is {date}. The current time is {time}.
 
+# Lets the bot permanently remember things for itself (via the remember_note tool) when a user
+# asks it to — standing instructions, facts about people, running jokes, etc. Notes persist in
+# prompt_notes.yaml and apply globally, across restarts. Manage them with /promptnotes view|clear.
+enable_prompt_notes: true
+max_prompt_notes: 50
+
 
 # MCP server settings:
 
