@@ -1,7 +1,7 @@
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
@@ -645,19 +645,29 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices
 
 
+MAX_REMINDER_STALENESS = timedelta(days=7)
+
+
 @tasks.loop(minutes=1)
 async def check_reminders_task() -> None:
     now_utc = datetime.now(timezone.utc)
     due: list[dict] = []
+    stale: list[dict] = []
 
     async with reminders_lock:
         data = await asyncio.to_thread(get_reminders)
         reminders = data.get("reminders", [])
         remaining = []
         for r in reminders:
-            (due if datetime.fromisoformat(r["remind_at_utc"]) <= now_utc else remaining).append(r)
+            remind_at_utc = datetime.fromisoformat(r["remind_at_utc"])
+            if now_utc - remind_at_utc > MAX_REMINDER_STALENESS:
+                stale.append(r)
+            elif remind_at_utc <= now_utc:
+                due.append(r)
+            else:
+                remaining.append(r)
 
-        if due:
+        if due or stale:
             data["reminders"] = remaining
 
             def _write() -> None:
@@ -665,6 +675,9 @@ async def check_reminders_task() -> None:
                     json.dump(data, file, indent=2, ensure_ascii=False)
 
             await asyncio.to_thread(_write)
+
+    for reminder in stale:
+        logging.info(f"Dropping reminder {reminder['id']} for user {reminder['user_id']} — over a week overdue, not sending: {reminder['message']!r}")
 
     for reminder in due:
         await deliver_reminder(reminder)
