@@ -1,19 +1,23 @@
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Literal, Optional
+from uuid import uuid4
 
+from dateparser.search import search_dates
 import discord
 from discord.app_commands import Choice
-from discord.ext import commands
+from discord.ext import commands, tasks
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from openai import AsyncOpenAI
+import pytz
 import yaml
 
 logging.basicConfig(
@@ -73,6 +77,60 @@ LOCAL_TOOLS = [
                     "note": {"type": "string", "description": "The text (or a close excerpt) of the note to forget, matched against your saved notes."},
                 },
                 "required": ["note"],
+            },
+        },
+    },
+]
+
+SET_REMINDER_TOOL_NAME = "set_reminder"
+LIST_REMINDERS_TOOL_NAME = "list_reminders"
+CANCEL_REMINDER_TOOL_NAME = "cancel_reminder"
+REMINDER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": SET_REMINDER_TOOL_NAME,
+            "description": (
+                "Set a personal reminder for the CURRENT user only — never for other users. Combine what to "
+                "be reminded about and when into one natural-language string, e.g. 'to check the oven in 20 "
+                "minutes' or 'to call mom tomorrow at 3pm'. The time is resolved server-side from wall-clock "
+                "time; don't try to compute or pass an ISO timestamp yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The reminder message and when to send it, combined in one natural-language sentence.",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone name (e.g. 'America/New_York') to interpret the time in. Defaults to Pacific time if omitted.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": LIST_REMINDERS_TOOL_NAME,
+            "description": "List the CURRENT user's own pending reminders. Never call this for other users.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": CANCEL_REMINDER_TOOL_NAME,
+            "description": "Cancel one of the CURRENT user's own pending reminders by id (shown by list_reminders). Never call this for other users.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The short id of the reminder to cancel, as shown by list_reminders."},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -153,6 +211,172 @@ async def clear_prompt_notes(filename: str = "prompt_notes.yaml") -> None:
                 yaml.safe_dump({"notes": []}, file, allow_unicode=True, sort_keys=False)
 
         await asyncio.to_thread(_write)
+
+
+reminders_lock = asyncio.Lock()
+
+LEADING_FILLER_RE = re.compile(
+    r"^(remind me to|remind me that|remind me about|remind me|to|that|about|for)\s+", re.IGNORECASE
+)
+
+
+class ReminderParseError(Exception):
+    pass
+
+
+def get_reminders(filename: str = "reminders.json") -> dict[str, Any]:
+    try:
+        with open(filename, encoding="utf-8") as file:
+            return json.load(file) or {"reminders": []}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"reminders": []}
+
+
+def resolve_timezone(tz_name: str) -> pytz.BaseTzInfo:
+    try:
+        return pytz.timezone(tz_name)
+    except pytz.UnknownTimeZoneError:
+        raise ReminderParseError(f"Unknown timezone '{tz_name}'. Use an IANA name like 'America/New_York'.")
+
+
+def parse_reminder_text(raw_text: str, timezone_name: str) -> tuple[str, datetime]:
+    """Extract a reminder message and a UTC datetime from free-form natural language.
+
+    Synchronous/CPU-bound (regex + dateparser) — callers should run this via asyncio.to_thread.
+    """
+    tz = resolve_timezone(timezone_name)
+
+    raw_text = raw_text.strip()
+    if not raw_text:
+        raise ReminderParseError("Please include what to remind you about and when, e.g. 'to check the oven in 20 minutes'.")
+
+    now_local = datetime.now(tz)
+    results = search_dates(
+        raw_text,
+        languages=["en"],
+        settings={
+            "TIMEZONE": timezone_name,
+            "TO_TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "PREFER_DATES_FROM": "future",
+            "RELATIVE_BASE": now_local.replace(tzinfo=None),
+            "DATE_ORDER": "MDY",
+            "PARSERS": ["relative-time", "absolute-time", "timestamp"],
+        },
+    )
+    if not results:
+        raise ReminderParseError("Couldn't find a date or time in that — try something like 'in 20 minutes' or 'tomorrow at 3pm'.")
+
+    matched_text, remind_at = max(results, key=lambda r: len(r[0]))
+    remind_at_utc = remind_at.astimezone(timezone.utc) if remind_at.tzinfo else remind_at.replace(tzinfo=timezone.utc)
+
+    now_utc = datetime.now(timezone.utc)
+    if remind_at_utc <= now_utc:
+        raise ReminderParseError("That resolved to a time in the past — try being more specific about when.")
+
+    # dateparser sometimes excludes a leading modifier (e.g. "next"/"last") from the matched span
+    # even though it used that word to resolve the date — extend the removed span to include it so
+    # it doesn't leak into the reminder message.
+    match_start = raw_text.find(matched_text)
+    removal_start = match_start
+    if match_start > 0:
+        modifier = re.search(r"\b(next|last|this|coming|upcoming)\s+$", raw_text[:match_start], re.IGNORECASE)
+        if modifier:
+            removal_start = modifier.start()
+
+    message = raw_text[:removal_start] + " " + raw_text[match_start + len(matched_text):]
+    message = re.sub(r"\s+", " ", message).strip()
+    message = LEADING_FILLER_RE.sub("", message).strip()
+    message = LEADING_FILLER_RE.sub("", message).strip(" ,.-")
+
+    if not message:
+        raise ReminderParseError("I found a time but no reminder message — try 'to <what> <when>'.")
+
+    return message, remind_at_utc
+
+
+async def add_reminder(
+    message: str,
+    remind_at_utc: datetime,
+    timezone_name: str,
+    user_id: int,
+    channel_id: int,
+    guild_id: Optional[int],
+    filename: str = "reminders.json",
+) -> str:
+    async with reminders_lock:
+        data = await asyncio.to_thread(get_reminders, filename)
+        reminders = data.setdefault("reminders", [])
+
+        max_reminders = config.get("max_reminders_per_user", 25)
+        if sum(1 for r in reminders if r["user_id"] == user_id) >= max_reminders:
+            return f"You already have {max_reminders} pending reminders — cancel one with /reminders before adding more."
+
+        existing_ids = {r["id"] for r in reminders}
+        reminder_id = uuid4().hex[:8]
+        while reminder_id in existing_ids:
+            reminder_id = uuid4().hex[:8]
+
+        reminders.append(
+            {
+                "id": reminder_id,
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "guild_id": guild_id,  # informational only; delivery routes by channel_id alone
+                "message": message,
+                "remind_at_utc": remind_at_utc.isoformat(),
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "timezone": timezone_name,
+            }
+        )
+
+        def _write() -> None:
+            with open(filename, "w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2, ensure_ascii=False)
+
+        await asyncio.to_thread(_write)
+
+    local_time = remind_at_utc.astimezone(resolve_timezone(timezone_name))
+    return f"Reminder set: **{message}** — {local_time.strftime('%b %d, %Y %I:%M %p %Z')} (id: `{reminder_id}`)"
+
+
+async def format_user_reminders(user_id: int, filename: str = "reminders.json") -> str:
+    data = await asyncio.to_thread(get_reminders, filename)
+    reminders = sorted(
+        (r for r in data.get("reminders", []) if r["user_id"] == user_id),
+        key=lambda r: r["remind_at_utc"],
+    )
+
+    if not reminders:
+        return "You have no pending reminders."
+
+    lines = []
+    for r in reminders:
+        remind_at_utc = datetime.fromisoformat(r["remind_at_utc"])
+        local_time = remind_at_utc.astimezone(resolve_timezone(r["timezone"]))
+        lines.append(f"- `{r['id']}`: {r['message']} — {local_time.strftime('%b %d, %Y %I:%M %p %Z')}")
+
+    return "**Your reminders:**\n" + "\n".join(lines)
+
+
+async def cancel_reminder(reminder_id: str, user_id: int, filename: str = "reminders.json") -> str:
+    async with reminders_lock:
+        data = await asyncio.to_thread(get_reminders, filename)
+        reminders = data.get("reminders", [])
+
+        for i, r in enumerate(reminders):
+            if r["id"] == reminder_id and r["user_id"] == user_id:
+                removed = reminders.pop(i)
+                data["reminders"] = reminders
+
+                def _write() -> None:
+                    with open(filename, "w", encoding="utf-8") as file:
+                        json.dump(data, file, indent=2, ensure_ascii=False)
+
+                await asyncio.to_thread(_write)
+                return f"Cancelled: {removed['message']!r}"
+
+        return f"No pending reminder found with id `{reminder_id}`."
 
 
 intents = discord.Intents.default()
@@ -381,6 +605,33 @@ async def promptnotes_command(interaction: discord.Interaction, action: Literal[
     await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
 
 
+@discord_bot.tree.command(name="remindme", description="Set a reminder using natural language, e.g. 'to check the oven in 20 minutes'")
+async def remindme_command(interaction: discord.Interaction, text: str, timezone: Optional[str] = None) -> None:
+    tz_name = timezone or config.get("default_reminder_timezone", "America/Los_Angeles")
+    try:
+        message, remind_at_utc = await asyncio.to_thread(parse_reminder_text, text, tz_name)
+        output = await add_reminder(
+            message, remind_at_utc, tz_name, interaction.user.id, interaction.channel_id, getattr(interaction.guild, "id", None)
+        )
+    except ReminderParseError as e:
+        output = f"Couldn't set that reminder: {e}"
+
+    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+
+
+@discord_bot.tree.command(name="reminders", description="List or cancel your pending reminders")
+async def reminders_command(interaction: discord.Interaction, action: Literal["list", "cancel"] = "list", reminder_id: Optional[str] = None) -> None:
+    if action == "cancel":
+        if not reminder_id:
+            output = "Provide a reminder id to cancel (see `/reminders` list)."
+        else:
+            output = await cancel_reminder(reminder_id, interaction.user.id)
+    else:
+        output = await format_user_reminders(interaction.user.id)
+
+    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+
+
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     global config
@@ -394,12 +645,61 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices
 
 
+@tasks.loop(hours=1)
+async def check_reminders_task() -> None:
+    now_utc = datetime.now(timezone.utc)
+    due: list[dict] = []
+
+    async with reminders_lock:
+        data = await asyncio.to_thread(get_reminders)
+        reminders = data.get("reminders", [])
+        remaining = []
+        for r in reminders:
+            (due if datetime.fromisoformat(r["remind_at_utc"]) <= now_utc else remaining).append(r)
+
+        if due:
+            data["reminders"] = remaining
+
+            def _write() -> None:
+                with open("reminders.json", "w", encoding="utf-8") as file:
+                    json.dump(data, file, indent=2, ensure_ascii=False)
+
+            await asyncio.to_thread(_write)
+
+    for reminder in due:
+        await deliver_reminder(reminder)
+
+
+async def deliver_reminder(reminder: dict) -> None:
+    text = f"⏰ <@{reminder['user_id']}> reminder: {reminder['message']}"
+    try:
+        channel = discord_bot.get_channel(reminder["channel_id"]) or await discord_bot.fetch_channel(reminder["channel_id"])
+        await channel.send(text)
+        return
+    except Exception as e:
+        logging.warning(f"Failed to deliver reminder {reminder['id']} to channel {reminder['channel_id']}: {e}")
+
+    try:
+        user = discord_bot.get_user(reminder["user_id"]) or await discord_bot.fetch_user(reminder["user_id"])
+        await user.send(f"⏰ Reminder: {reminder['message']}")
+    except Exception as e:
+        logging.exception(f"Failed to deliver reminder {reminder['id']} to user {reminder['user_id']} via DM: {e}")
+
+
+@check_reminders_task.before_loop
+async def before_check_reminders_task() -> None:
+    await discord_bot.wait_until_ready()
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config["client_id"]:
         logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
 
     await discord_bot.tree.sync()
+
+    if config.get("enable_reminders", True) and not check_reminders_task.is_running():
+        check_reminders_task.start()
 
 
 @discord_bot.event
@@ -584,7 +884,11 @@ async def on_message(new_msg: discord.Message) -> None:
     if mcp_servers:
         mcp_tools_list, mcp_tool_server_map = await fetch_mcp_tools(mcp_servers)
 
-    tools_list = (LOCAL_TOOLS if config.get("enable_prompt_notes", True) else []) + mcp_tools_list
+    tools_list = (
+        (LOCAL_TOOLS if config.get("enable_prompt_notes", True) else [])
+        + (REMINDER_TOOLS if config.get("enable_reminders", True) else [])
+        + mcp_tools_list
+    )
 
     completion_messages = messages[::-1]
     if mcp_tools_list:
@@ -744,6 +1048,30 @@ async def on_message(new_msg: discord.Message) -> None:
                                 return "Error: 'note' is required and cannot be empty"
                             result = await forget_prompt_note(query)
                             logging.info(f"Prompt note forget requested by user ID {new_msg.author.id}: {query!r} -> {result}")
+                            return result
+
+                        if tool_name == SET_REMINDER_TOOL_NAME:
+                            if not (text := arguments.get("text", "").strip()):
+                                return "Error: 'text' is required and cannot be empty"
+                            tz_name = arguments.get("timezone") or config.get("default_reminder_timezone", "America/Los_Angeles")
+                            try:
+                                message, remind_at_utc = await asyncio.to_thread(parse_reminder_text, text, tz_name)
+                            except ReminderParseError as e:
+                                return f"Error: {e}"
+                            result = await add_reminder(
+                                message, remind_at_utc, tz_name, new_msg.author.id, new_msg.channel.id, getattr(new_msg.guild, "id", None)
+                            )
+                            logging.info(f"Reminder set by user ID {new_msg.author.id}: {message!r} at {remind_at_utc.isoformat()}")
+                            return result
+
+                        if tool_name == LIST_REMINDERS_TOOL_NAME:
+                            return await format_user_reminders(new_msg.author.id)
+
+                        if tool_name == CANCEL_REMINDER_TOOL_NAME:
+                            if not (reminder_id := arguments.get("id", "").strip()):
+                                return "Error: 'id' is required and cannot be empty"
+                            result = await cancel_reminder(reminder_id, new_msg.author.id)
+                            logging.info(f"Reminder cancel requested by user ID {new_msg.author.id}: {reminder_id!r} -> {result}")
                             return result
 
                         server_url = mcp_tool_server_map.get(tool_name)
