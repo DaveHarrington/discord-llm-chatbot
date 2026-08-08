@@ -235,7 +235,9 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
     else:
-        if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        admins_only = config.get("restrict_model_command_to_admins", True)
+        user_is_admin = interaction.user.id in config["permissions"]["users"]["admin_ids"]
+        if not admins_only or user_is_admin:
             curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)
@@ -432,18 +434,18 @@ async def on_message(new_msg: discord.Message) -> None:
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
     prompt_notes_list = prompt_notes.get("notes", [])
-    if (system_prompt := config["system_prompt"]) or prompt_notes_list:
-        now = datetime.now().astimezone()
+    now = datetime.now().astimezone()
 
-        system_prompt = (system_prompt or "").replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
-        if accept_usernames:
-            system_prompt += "\nUser's names are their Discord IDs and should be typed as '<@ID>'."
+    system_prompt = (config["system_prompt"] or "").replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+    system_prompt += f"\n\nYou are currently running as the model '{provider_slash_model}'. If asked what model you are, answer with this."
+    if accept_usernames:
+        system_prompt += "\nUser's names are their Discord IDs and should be typed as '<@ID>'."
 
-        if prompt_notes_list:
-            notes_text = "\n".join(f"- {note['text']}" for note in prompt_notes_list)
-            system_prompt += f"\n\nThings you've saved for yourself to remember (apply globally, to all users):\n{notes_text}"
+    if prompt_notes_list:
+        notes_text = "\n".join(f"- {note['text']}" for note in prompt_notes_list)
+        system_prompt += f"\n\nThings you've saved for yourself to remember (apply globally, to all users):\n{notes_text}"
 
-        messages.append(dict(role="system", content=system_prompt))
+    messages.append(dict(role="system", content=system_prompt))
 
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = None
