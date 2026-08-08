@@ -645,7 +645,7 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices
 
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=1)
 async def check_reminders_task() -> None:
     now_utc = datetime.now(timezone.utc)
     due: list[dict] = []

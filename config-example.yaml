@@ -101,7 +101,7 @@ max_prompt_notes: 50
 
 # Lets users create personal reminders via /remindme or the set_reminder tool, delivered back in the
 # same channel/DM (with a DM fallback if that channel becomes unreachable) at the requested time.
-# Checked once per hour, so reminders are not sub-hour precise. Reminders persist in reminders.json
+# Checked once per minute. Reminders persist in reminders.json
 # across restarts, scoped per-user. Manage your own with /reminders list|cancel.
 enable_reminders: true
 # Default IANA timezone used to interpret /remindme and set_reminder text when no timezone is given.
