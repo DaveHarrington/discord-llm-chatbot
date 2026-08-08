@@ -235,7 +235,9 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
     else:
-        if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        admins_only = config.get("restrict_model_command_to_admins", True)
+        user_is_admin = interaction.user.id in config["permissions"]["users"]["admin_ids"]
+        if not admins_only or user_is_admin:
             curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)

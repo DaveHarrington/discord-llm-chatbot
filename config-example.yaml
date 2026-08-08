@@ -10,6 +10,7 @@ max_messages: 25
 
 use_plain_responses: false
 allow_dms: true
+restrict_model_command_to_admins: true
 
 permissions:
   users:
