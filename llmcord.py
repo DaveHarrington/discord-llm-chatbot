@@ -94,7 +94,8 @@ REMINDER_TOOLS = [
                 "Set a personal reminder for the CURRENT user only — never for other users. Combine what to "
                 "be reminded about and when into one natural-language string, e.g. 'to check the oven in 20 "
                 "minutes' or 'to call mom tomorrow at 3pm'. The time is resolved server-side from wall-clock "
-                "time; don't try to compute or pass an ISO timestamp yourself."
+                "time; don't try to compute or pass an ISO timestamp yourself. Reminders are checked once per "
+                "minute, so only minute-level precision is possible — don't promise second-level accuracy."
             ),
             "parameters": {
                 "type": "object",
