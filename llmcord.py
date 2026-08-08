@@ -337,6 +337,11 @@ async def on_message(new_msg: discord.Message) -> None:
     extra_query = provider_config.get("extra_query", None)
     extra_body = (provider_config.get("extra_body", None) or {}) | (model_parameters or {}) or None
 
+    # Native provider-hosted web search (e.g. LiteLLM -> Anthropic web_search_20250305).
+    # `web_search: true` enables it with defaults; a dict is passed through as web_search_options.
+    web_search = provider_config.get("web_search")
+    web_search_options = web_search if isinstance(web_search, dict) else ({} if web_search else None)
+
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
 
@@ -486,6 +491,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 kwargs = dict(model=model, messages=completion_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
                 if tools_list:
                     kwargs["tools"] = tools_list
+                if web_search_options is not None:
+                    kwargs["web_search_options"] = web_search_options
 
                 async for chunk in await openai_client.chat.completions.create(**kwargs):
                     if finish_reason != None:
@@ -560,8 +567,12 @@ async def on_message(new_msg: discord.Message) -> None:
 
                             last_task_time = datetime.now().timestamp()
 
-                # If the model requested tool calls, execute them and loop again
-                if tool_calls_buf:
+                # If the model requested tool calls that WE need to execute, do so and loop again.
+                # Note: provider-hosted tools (e.g. Anthropic's native web_search) also stream as
+                # tool_calls deltas even though they're already resolved server-side — those finish
+                # with finish_reason "stop"/"end_turn" (not "tool_calls"), with the real answer
+                # already in curr_content, so they must not be routed into local tool execution.
+                if tool_calls_buf and finish_reason == "tool_calls":
                     tool_call_iterations += 1
                     tool_calls_list = []
                     for idx in sorted(tool_calls_buf.keys()):

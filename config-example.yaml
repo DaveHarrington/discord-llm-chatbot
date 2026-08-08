@@ -26,6 +26,10 @@ permissions:
 
 # LLM settings:
 
+# Any provider entry can set `web_search: true` (or a dict of options, e.g.
+# `web_search: {search_context_size: high}`) to pass OpenAI's `web_search_options`
+# through to the endpoint. Real OpenAI honors this on search-preview models; a
+# LiteLLM proxy in front of Anthropic maps it to Claude's native web_search tool.
 providers:
   # Remote providers:
   azure-openai:
