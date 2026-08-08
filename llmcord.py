@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
-from typing import Any, Literal, Optional
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Literal, Optional
 
 import discord
 from discord.app_commands import Choice
@@ -212,6 +213,119 @@ async def call_mcp_tool(server_url: str, tool_name: str, arguments: dict) -> str
         return f"Error: failed to call tool '{tool_name}'"
 
 
+# --- Responses API support -------------------------------------------------
+# Some providers (e.g. Meta's api.meta.ai) only expose native/hosted web search
+# through their Responses API (`client.responses.create`), not through Chat
+# Completions. To reuse the existing Chat-Completions-shaped streaming/tool-call
+# loop below unchanged, we call the Responses API once (non-streaming) and
+# translate its output into a couple of synthetic chunks matching the shape
+# `openai_client.chat.completions.create(stream=True)` yields.
+
+
+def _chat_content_to_responses_input(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    parts = []
+    for part in content:
+        if part["type"] == "text":
+            parts.append({"type": "input_text", "text": part["text"]})
+        elif part["type"] == "image_url":
+            parts.append({"type": "input_image", "image_url": part["image_url"]["url"]})
+    return parts
+
+
+def _responses_input_from_messages(completion_messages: list[dict]) -> list[dict]:
+    input_items = []
+    for msg in completion_messages:
+        role = msg.get("role")
+        if role == "tool":
+            input_items.append({"type": "function_call_output", "call_id": msg["tool_call_id"], "output": msg.get("content") or ""})
+        elif role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                input_items.append({"type": "function_call", "call_id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]})
+        else:
+            input_items.append({"role": role, "content": _chat_content_to_responses_input(msg["content"])})
+    return input_items
+
+
+def _responses_tools_from_chat_tools(tools_list: list[dict], include_web_search: bool) -> list[dict]:
+    converted = [{"type": "function", "name": tool["function"]["name"], "description": tool["function"].get("description", ""), "parameters": tool["function"]["parameters"]} for tool in tools_list]
+    if include_web_search:
+        converted.append({"type": "web_search"})
+    return converted
+
+
+def _responses_output_to_chunks(response: Any) -> list[SimpleNamespace]:
+    def _delta_chunk(*, content, tool_calls, finish_reason) -> SimpleNamespace:
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=tool_calls), finish_reason=finish_reason)])
+
+    function_calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
+
+    if function_calls:
+        tool_call_deltas = [
+            SimpleNamespace(index=i, id=fc.call_id, function=SimpleNamespace(name=fc.name, arguments=fc.arguments)) for i, fc in enumerate(function_calls)
+        ]
+        return [
+            _delta_chunk(content=None, tool_calls=tool_call_deltas, finish_reason=None),
+            _delta_chunk(content="", tool_calls=None, finish_reason="tool_calls"),
+        ]
+
+    text_parts = []
+    citations = []
+    for item in response.output:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content_part in getattr(item, "content", None) or []:
+            if getattr(content_part, "type", None) != "output_text":
+                continue
+            text_parts.append(content_part.text)
+            for ann in getattr(content_part, "annotations", None) or []:
+                if getattr(ann, "type", None) == "url_citation":
+                    citations.append((ann.title, ann.url))
+
+    full_text = "".join(text_parts)
+    if citations:
+        seen = set()
+        lines = []
+        for title, url in citations:
+            if url not in seen:
+                seen.add(url)
+                lines.append(f"- [{title}]({url})")
+        if lines:
+            full_text += "\n\n**Sources:**\n" + "\n".join(lines)
+
+    return [
+        _delta_chunk(content=full_text, tool_calls=None, finish_reason=None),
+        _delta_chunk(content="", tool_calls=None, finish_reason="stop"),
+    ]
+
+
+async def _fake_async_iter(items: list) -> AsyncIterator:
+    for item in items:
+        yield item
+
+
+async def responses_api_stream(
+    openai_client: AsyncOpenAI,
+    *,
+    model: str,
+    completion_messages: list[dict],
+    tools_list: list[dict],
+    extra_headers: Optional[dict],
+    extra_query: Optional[dict],
+    extra_body: Optional[dict],
+) -> AsyncIterator:
+    response = await openai_client.responses.create(
+        model=model,
+        input=_responses_input_from_messages(completion_messages),
+        tools=_responses_tools_from_chat_tools(tools_list, include_web_search=True),
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        extra_body=extra_body,
+    )
+    return _fake_async_iter(_responses_output_to_chunks(response))
+
+
 @dataclass
 class MsgNode:
     text: Optional[str] = None
@@ -339,10 +453,14 @@ async def on_message(new_msg: discord.Message) -> None:
     extra_query = provider_config.get("extra_query", None)
     extra_body = (provider_config.get("extra_body", None) or {}) | (model_parameters or {}) or None
 
-    # Native provider-hosted web search (e.g. LiteLLM -> Anthropic web_search_20250305).
-    # `web_search: true` enables it with defaults; a dict is passed through as web_search_options.
+    # Native provider-hosted web search.
+    # `web_search: true` (or a dict) enables it via Chat Completions' `web_search_options`
+    # passthrough (e.g. LiteLLM -> Anthropic web_search_20250305).
+    # `web_search: responses_api` instead routes generation through the Responses API,
+    # for providers (e.g. Meta) whose hosted web_search tool only exists there.
     web_search = provider_config.get("web_search")
-    web_search_options = web_search if isinstance(web_search, dict) else ({} if web_search else None)
+    use_responses_api = web_search == "responses_api"
+    web_search_options = None if use_responses_api else (web_search if isinstance(web_search, dict) else ({} if web_search else None))
 
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
@@ -490,13 +608,25 @@ async def on_message(new_msg: discord.Message) -> None:
                 tool_calls_buf: dict[int, dict] = {}
                 curr_content = finish_reason = None
 
-                kwargs = dict(model=model, messages=completion_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
-                if tools_list:
-                    kwargs["tools"] = tools_list
-                if web_search_options is not None:
-                    kwargs["web_search_options"] = web_search_options
+                if use_responses_api:
+                    call_coro = responses_api_stream(
+                        openai_client,
+                        model=model,
+                        completion_messages=completion_messages,
+                        tools_list=tools_list,
+                        extra_headers=extra_headers,
+                        extra_query=extra_query,
+                        extra_body=extra_body,
+                    )
+                else:
+                    kwargs = dict(model=model, messages=completion_messages, stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+                    if tools_list:
+                        kwargs["tools"] = tools_list
+                    if web_search_options is not None:
+                        kwargs["web_search_options"] = web_search_options
+                    call_coro = openai_client.chat.completions.create(**kwargs)
 
-                async for chunk in await openai_client.chat.completions.create(**kwargs):
+                async for chunk in await call_coro:
                     if finish_reason != None:
                         break
 

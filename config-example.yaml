@@ -31,6 +31,12 @@ permissions:
 # `web_search: {search_context_size: high}`) to pass OpenAI's `web_search_options`
 # through to the endpoint. Real OpenAI honors this on search-preview models; a
 # LiteLLM proxy in front of Anthropic maps it to Claude's native web_search tool.
+#
+# Some providers (e.g. Meta's api.meta.ai) only expose hosted web search through
+# their Responses API, not Chat Completions. Set `web_search: responses_api` on
+# those providers instead — generation is routed through `client.responses.create`
+# with a `web_search` tool, and results are translated back into the normal
+# streaming/tool-call flow.
 providers:
   # Remote providers:
   azure-openai:
