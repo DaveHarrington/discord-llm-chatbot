@@ -91,25 +91,37 @@ REMINDER_TOOLS = [
         "function": {
             "name": SET_REMINDER_TOOL_NAME,
             "description": (
-                "Set a personal reminder for the CURRENT user only — never for other users. Combine what to "
-                "be reminded about and when into one natural-language string, e.g. 'to check the oven in 20 "
-                "minutes' or 'to call mom tomorrow at 3pm'. The time is resolved server-side from wall-clock "
-                "time; don't try to compute or pass an ISO timestamp yourself. Reminders are checked once per "
-                "minute, so only minute-level precision is possible — don't promise second-level accuracy."
+                "Set a personal reminder for the CURRENT user only — never for other users. Provide the "
+                "message and the time as two separate fields — don't merge them into one string. The time is "
+                "resolved server-side from wall-clock time; don't try to compute or pass an ISO timestamp "
+                "yourself. Reminders are checked once per minute, so only minute-level precision is possible "
+                "— don't promise second-level accuracy."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {
+                    "message": {
                         "type": "string",
-                        "description": "The reminder message and when to send it, combined in one natural-language sentence.",
+                        "description": (
+                            "The exact text to send back when the reminder fires, written as a standalone "
+                            "sentence, e.g. 'check the oven' or \"it's scheduled to land in Tokyo around "
+                            "9:15pm\". Include any clock times that are part of the meaningful content here — "
+                            "only the actual trigger time goes in `when`, not this field."
+                        ),
+                    },
+                    "when": {
+                        "type": "string",
+                        "description": (
+                            "When to send the reminder, as a natural-language time expression only, e.g. 'in "
+                            "20 minutes', 'tomorrow at 3pm', 'in 3 hours'. Don't include the reminder content here."
+                        ),
                     },
                     "timezone": {
                         "type": "string",
                         "description": "Optional IANA timezone name (e.g. 'America/New_York') to interpret the time in. Defaults to Pacific time if omitted.",
                     },
                 },
-                "required": ["text"],
+                "required": ["message", "when"],
             },
         },
     },
@@ -216,10 +228,6 @@ async def clear_prompt_notes(filename: str = "prompt_notes.yaml") -> None:
 
 reminders_lock = asyncio.Lock()
 
-LEADING_FILLER_RE = re.compile(
-    r"^(remind me to|remind me that|remind me about|remind me|to|that|about|for)\s+", re.IGNORECASE
-)
-
 
 class ReminderParseError(Exception):
     pass
@@ -240,20 +248,20 @@ def resolve_timezone(tz_name: str) -> pytz.BaseTzInfo:
         raise ReminderParseError(f"Unknown timezone '{tz_name}'. Use an IANA name like 'America/New_York'.")
 
 
-def parse_reminder_text(raw_text: str, timezone_name: str) -> tuple[str, datetime]:
-    """Extract a reminder message and a UTC datetime from free-form natural language.
+def parse_reminder_when(when_text: str, timezone_name: str) -> datetime:
+    """Resolve a natural-language time expression (e.g. 'in 20 minutes', 'tomorrow at 3pm') to a UTC datetime.
 
-    Synchronous/CPU-bound (regex + dateparser) — callers should run this via asyncio.to_thread.
+    Synchronous/CPU-bound (dateparser) — callers should run this via asyncio.to_thread.
     """
     tz = resolve_timezone(timezone_name)
 
-    raw_text = raw_text.strip()
-    if not raw_text:
-        raise ReminderParseError("Please include what to remind you about and when, e.g. 'to check the oven in 20 minutes'.")
+    when_text = when_text.strip()
+    if not when_text:
+        raise ReminderParseError("Please say when to send the reminder, e.g. 'in 20 minutes' or 'tomorrow at 3pm'.")
 
     now_local = datetime.now(tz)
     results = search_dates(
-        raw_text,
+        when_text,
         languages=["en"],
         settings={
             "TIMEZONE": timezone_name,
@@ -268,32 +276,14 @@ def parse_reminder_text(raw_text: str, timezone_name: str) -> tuple[str, datetim
     if not results:
         raise ReminderParseError("Couldn't find a date or time in that — try something like 'in 20 minutes' or 'tomorrow at 3pm'.")
 
-    matched_text, remind_at = max(results, key=lambda r: len(r[0]))
+    _, remind_at = max(results, key=lambda r: len(r[0]))
     remind_at_utc = remind_at.astimezone(timezone.utc) if remind_at.tzinfo else remind_at.replace(tzinfo=timezone.utc)
 
     now_utc = datetime.now(timezone.utc)
     if remind_at_utc <= now_utc:
         raise ReminderParseError("That resolved to a time in the past — try being more specific about when.")
 
-    # dateparser sometimes excludes a leading modifier (e.g. "next"/"last") from the matched span
-    # even though it used that word to resolve the date — extend the removed span to include it so
-    # it doesn't leak into the reminder message.
-    match_start = raw_text.find(matched_text)
-    removal_start = match_start
-    if match_start > 0:
-        modifier = re.search(r"\b(next|last|this|coming|upcoming)\s+$", raw_text[:match_start], re.IGNORECASE)
-        if modifier:
-            removal_start = modifier.start()
-
-    message = raw_text[:removal_start] + " " + raw_text[match_start + len(matched_text):]
-    message = re.sub(r"\s+", " ", message).strip()
-    message = LEADING_FILLER_RE.sub("", message).strip()
-    message = LEADING_FILLER_RE.sub("", message).strip(" ,.-")
-
-    if not message:
-        raise ReminderParseError("I found a time but no reminder message — try 'to <what> <when>'.")
-
-    return message, remind_at_utc
+    return remind_at_utc
 
 
 async def add_reminder(
@@ -606,11 +596,17 @@ async def promptnotes_command(interaction: discord.Interaction, action: Literal[
     await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
 
 
-@discord_bot.tree.command(name="remindme", description="Set a reminder using natural language, e.g. 'to check the oven in 20 minutes'")
-async def remindme_command(interaction: discord.Interaction, text: str, timezone: Optional[str] = None) -> None:
+@discord_bot.tree.command(name="remindme", description="Set a reminder")
+async def remindme_command(
+    interaction: discord.Interaction,
+    message: str,
+    when: str,
+    timezone: Optional[str] = None,
+) -> None:
     tz_name = timezone or config.get("default_reminder_timezone", "America/Los_Angeles")
+    message = message.strip()
     try:
-        message, remind_at_utc = await asyncio.to_thread(parse_reminder_text, text, tz_name)
+        remind_at_utc = await asyncio.to_thread(parse_reminder_when, when, tz_name)
         output = await add_reminder(
             message, remind_at_utc, tz_name, interaction.user.id, interaction.channel_id, getattr(interaction.guild, "id", None)
         )
@@ -1065,11 +1061,13 @@ async def on_message(new_msg: discord.Message) -> None:
                             return result
 
                         if tool_name == SET_REMINDER_TOOL_NAME:
-                            if not (text := arguments.get("text", "").strip()):
-                                return "Error: 'text' is required and cannot be empty"
+                            if not (message := arguments.get("message", "").strip()):
+                                return "Error: 'message' is required and cannot be empty"
+                            if not (when_text := arguments.get("when", "").strip()):
+                                return "Error: 'when' is required and cannot be empty"
                             tz_name = arguments.get("timezone") or config.get("default_reminder_timezone", "America/Los_Angeles")
                             try:
-                                message, remind_at_utc = await asyncio.to_thread(parse_reminder_text, text, tz_name)
+                                remind_at_utc = await asyncio.to_thread(parse_reminder_when, when_text, tz_name)
                             except ReminderParseError as e:
                                 return f"Error: {e}"
                             result = await add_reminder(
