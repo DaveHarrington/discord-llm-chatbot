@@ -863,7 +863,10 @@ async def on_message(new_msg: discord.Message) -> None:
 
             curr_msg = curr_node.parent_msg
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    logging.info(
+        f"Message received (id: {new_msg.id}, author ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n"
+        f"----- BEGIN MESSAGE {new_msg.id} -----\n{new_msg.content}\n----- END MESSAGE {new_msg.id} -----"
+    )
 
     prompt_notes_list = prompt_notes.get("notes", [])
     now = datetime.now().astimezone()
@@ -1121,6 +1124,12 @@ async def on_message(new_msg: discord.Message) -> None:
 
     except Exception:
         logging.exception("Error while generating response")
+
+    final_response_text = "".join(response_contents)
+    logging.info(
+        f"Response sent (in reply to message id: {new_msg.id}, {len(response_msgs)} Discord message(s)):\n"
+        f"----- BEGIN RESPONSE {new_msg.id} -----\n{final_response_text}\n----- END RESPONSE {new_msg.id} -----"
+    )
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
