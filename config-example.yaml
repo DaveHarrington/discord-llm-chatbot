@@ -99,6 +99,15 @@ system_prompt: |
 enable_prompt_notes: true
 max_prompt_notes: 50
 
+# Lets users create personal reminders via /remindme or the set_reminder tool, delivered back in the
+# same channel/DM (with a DM fallback if that channel becomes unreachable) at the requested time.
+# Checked once per minute. Reminders persist in reminders.json
+# across restarts, scoped per-user. Manage your own with /reminders list|cancel.
+enable_reminders: true
+# Default IANA timezone used to interpret /remindme and set_reminder text when no timezone is given.
+default_reminder_timezone: America/Los_Angeles
+max_reminders_per_user: 25
+
 
 # MCP server settings:
 

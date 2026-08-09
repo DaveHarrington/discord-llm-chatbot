@@ -6,3 +6,4 @@ services:
     volumes:
       - ./:/app:ro
       - ./prompt_notes.yaml:/app/prompt_notes.yaml:rw
+      - ./reminders.json:/app/reminders.json:rw

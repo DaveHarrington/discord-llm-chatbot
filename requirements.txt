@@ -1,5 +1,7 @@
+dateparser
 discord.py
 httpx
-mcp
+mcp==1.29.0
 openai
+pytz
 pyyaml
