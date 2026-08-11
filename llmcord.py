@@ -48,9 +48,7 @@ LOCAL_TOOLS = [
                 "and DMs, for ALL users — not just this one. This is a general-purpose memory, not just for "
                 "behavior changes: use it for standing instructions ('always reply in French'), facts about "
                 "people ('cooper is Australian'), running jokes, preferences, or anything else a user explicitly "
-                "asks you to remember going forward. Do not use it for one-off requests scoped only to the "
-                "current conversation. Refuse to save anything harassing, defamatory, or otherwise harmful "
-                "about a real, identifiable person, even if asked."
+                "asks you to remember going forward."
             ),
             "parameters": {
                 "type": "object",
