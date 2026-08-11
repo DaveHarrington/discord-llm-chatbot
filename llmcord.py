@@ -14,8 +14,7 @@ import discord
 from discord.app_commands import Choice
 from discord.ext import commands, tasks
 import httpx
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client import Client
 from openai import AsyncOpenAI
 import pytz
 import yaml
@@ -386,26 +385,24 @@ async def fetch_mcp_tools(mcp_servers: dict[str, dict]) -> tuple[list[dict], dic
         if not url:
             continue
         try:
-            async with streamablehttp_client(url) as (read, write, _):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.list_tools()
-                    for tool in result.tools:
-                        tools.append({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description or "",
-                                "parameters": tool.inputSchema,
-                            },
-                        })
-                        if tool.name in tool_server_map:
-                            logging.warning(
-                                f"MCP tool name collision for '{tool.name}': "
-                                f"{tool_server_map[tool.name]} -> {url}. Using latest server."
-                            )
-                        tool_server_map[tool.name] = url
-                    logging.info(f"Loaded {len(result.tools)} tools from MCP server '{server_name}' ({url})")
+            async with Client(url, mode="auto") as client:
+                result = await client.list_tools()
+                for tool in result.tools:
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "parameters": tool.input_schema,
+                        },
+                    })
+                    if tool.name in tool_server_map:
+                        logging.warning(
+                            f"MCP tool name collision for '{tool.name}': "
+                            f"{tool_server_map[tool.name]} -> {url}. Using latest server."
+                        )
+                    tool_server_map[tool.name] = url
+                logging.info(f"Loaded {len(result.tools)} tools from MCP server '{server_name}' ({url})")
         except Exception:
             logging.exception(f"Failed to fetch MCP tools from '{server_name}' ({url})")
 
@@ -415,12 +412,10 @@ async def fetch_mcp_tools(mcp_servers: dict[str, dict]) -> tuple[list[dict], dic
 async def call_mcp_tool(server_url: str, tool_name: str, arguments: dict) -> str:
     """Call a single MCP tool and return its text result."""
     try:
-        async with streamablehttp_client(server_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                parts = [block.text for block in result.content if hasattr(block, "text")]
-                return "\n".join(parts) if parts else ""
+        async with Client(server_url, mode="auto") as client:
+            result = await client.call_tool(tool_name, arguments)
+            parts = [block.text for block in result.content if hasattr(block, "text")]
+            return "\n".join(parts) if parts else ""
     except Exception:
         logging.exception(f"Error calling MCP tool '{tool_name}' on {server_url}")
         return f"Error: failed to call tool '{tool_name}'"
