@@ -376,7 +376,7 @@ httpx_client = httpx.AsyncClient()
 
 _MCP_STATELESS_HEADERS = {
     "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
+    "Accept": "application/json",
     "MCP-Protocol-Version": "2026-07-28",
 }
 _MCP_STATELESS_META = {
@@ -395,32 +395,33 @@ async def fetch_mcp_tools(mcp_servers: dict[str, dict]) -> tuple[list[dict], dic
         if not url:
             continue
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url,
-                    headers={**_MCP_STATELESS_HEADERS, "Mcp-Method": "tools/list"},
-                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": _MCP_STATELESS_META}},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                mcp_tools = data.get("result", {}).get("tools", [])
-                for tool in mcp_tools:
-                    tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": tool["name"],
-                            "description": tool.get("description") or "",
-                            "parameters": tool.get("inputSchema", {}),
-                        },
-                    })
-                    if tool["name"] in tool_server_map:
-                        logging.warning(
-                            f"MCP tool name collision for '{tool['name']}': "
-                            f"{tool_server_map[tool['name']]} -> {url}. Using latest server."
-                        )
-                    tool_server_map[tool["name"]] = url
-                logging.info(f"Loaded {len(mcp_tools)} tools from MCP server '{server_name}' ({url})")
+            resp = await httpx_client.post(
+                url,
+                headers={**_MCP_STATELESS_HEADERS, "Mcp-Method": "tools/list"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": _MCP_STATELESS_META}},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                raise RuntimeError(f"JSON-RPC error: {data['error']}")
+            mcp_tools = data.get("result", {}).get("tools", [])
+            for tool in mcp_tools:
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description") or "",
+                        "parameters": tool.get("inputSchema", {}),
+                    },
+                })
+                if tool["name"] in tool_server_map:
+                    logging.warning(
+                        f"MCP tool name collision for '{tool['name']}': "
+                        f"{tool_server_map[tool['name']]} -> {url}. Using latest server."
+                    )
+                tool_server_map[tool["name"]] = url
+            logging.info(f"Loaded {len(mcp_tools)} tools from MCP server '{server_name}' ({url})")
         except Exception:
             logging.exception(f"Failed to fetch MCP tools from '{server_name}' ({url})")
 
@@ -430,23 +431,24 @@ async def fetch_mcp_tools(mcp_servers: dict[str, dict]) -> tuple[list[dict], dic
 async def call_mcp_tool(server_url: str, tool_name: str, arguments: dict) -> str:
     """Call a single MCP tool and return its text result."""
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                server_url,
-                headers={**_MCP_STATELESS_HEADERS, "Mcp-Method": "tools/call"},
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {"name": tool_name, "arguments": arguments, "_meta": _MCP_STATELESS_META},
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data.get("result", {}).get("content", [])
-            parts = [block["text"] for block in content if block.get("type") == "text" and "text" in block]
-            return "\n".join(parts) if parts else ""
+        resp = await httpx_client.post(
+            server_url,
+            headers={**_MCP_STATELESS_HEADERS, "Mcp-Method": "tools/call"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments, "_meta": _MCP_STATELESS_META},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(f"JSON-RPC error: {data['error']}")
+        content = data.get("result", {}).get("content", [])
+        parts = [block["text"] for block in content if block.get("type") == "text" and "text" in block]
+        return "\n".join(parts) if parts else ""
     except Exception:
         logging.exception(f"Error calling MCP tool '{tool_name}' on {server_url}")
         return f"Error: failed to call tool '{tool_name}'"
