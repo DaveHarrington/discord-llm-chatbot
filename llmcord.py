@@ -1,7 +1,8 @@
 import asyncio
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 import json
 import logging
 import re
@@ -148,6 +149,40 @@ REMINDER_TOOLS = [
         },
     },
 ]
+
+GENERATE_IMAGE_TOOL_NAME = "generate_image"
+IMAGE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": GENERATE_IMAGE_TOOL_NAME,
+            "description": (
+                "Generate an image from a text description. The image is attached to your Discord reply automatically, "
+                "so don't paste links or describe it at length. Only use this when a user asks you to draw, create, make "
+                "or generate a picture, image, photo, meme, logo, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "A detailed description of the image: subject, style, composition, colours, mood."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+]
+
+
+async def generate_image(prompt: str) -> tuple[bytes, str]:
+    """Generate one image with the configured image model. Returns (image bytes, file extension)."""
+    image_config = config["image_generation"]
+    provider_config = config["providers"][image_config["provider"]]
+    client = AsyncOpenAI(base_url=provider_config["base_url"], api_key=provider_config.get("api_key", "sk-no-key-required"))
+    result = await client.images.generate(model=image_config["model"], prompt=prompt, n=1)
+    image = result.data[0]
+    data = b64decode(image.b64_json) if image.b64_json else (await httpx_client.get(image.url)).content
+    ext = "webp" if data[8:12] == b"WEBP" else "jpg" if data[:3] == b"\xff\xd8\xff" else "png"
+    return data, ext
 
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
@@ -906,6 +941,7 @@ async def on_message(new_msg: discord.Message) -> None:
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
+    generated_images: list[discord.File] = []
 
     embed = discord.Embed()
     for warning in sorted(user_warnings):
@@ -924,6 +960,7 @@ async def on_message(new_msg: discord.Message) -> None:
     tools_list = (
         (LOCAL_TOOLS if config.get("enable_prompt_notes", True) else [])
         + (REMINDER_TOOLS if config.get("enable_reminders", True) else [])
+        + (IMAGE_TOOLS if config.get("image_generation") else [])
         + mcp_tools_list
     )
 
@@ -1113,6 +1150,21 @@ async def on_message(new_msg: discord.Message) -> None:
                             logging.info(f"Reminder cancel requested by user ID {new_msg.author.id}: {reminder_id!r} -> {result}")
                             return result
 
+                        if tool_name == GENERATE_IMAGE_TOOL_NAME:
+                            if not (prompt := arguments.get("prompt", "").strip()):
+                                return "Error: 'prompt' is required and cannot be empty"
+                            max_images_per_message = config["image_generation"].get("max_per_message", 2)
+                            if len(generated_images) >= max_images_per_message:
+                                return f"Error: limit of {max_images_per_message} generated images per message reached"
+                            try:
+                                data, ext = await generate_image(prompt)
+                            except Exception as e:
+                                logging.exception("Error generating image")
+                                return f"Error: image generation failed ({type(e).__name__})"
+                            generated_images.append(discord.File(BytesIO(data), filename=f"image-{len(generated_images) + 1}.{ext}"))
+                            logging.info(f"Image generated for user ID {new_msg.author.id} ({len(data)} bytes): {prompt!r}")
+                            return "Done: the image will be attached to your reply."
+
                         server_url = mcp_tool_server_map.get(tool_name)
                         if not server_url:
                             logging.warning(f"MCP tool '{tool_name}' not found in any configured server")
@@ -1139,6 +1191,16 @@ async def on_message(new_msg: discord.Message) -> None:
                 for content in response_contents:
                     reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
                     response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
+                    response_msgs.append(response_msg)
+
+                    msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                    await msg_nodes[response_msg.id].lock.acquire()
+
+            if generated_images:
+                if response_msgs:
+                    await response_msgs[-1].edit(attachments=generated_images)
+                else:
+                    response_msg = await new_msg.reply(files=generated_images, silent=True)
                     response_msgs.append(response_msg)
 
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)

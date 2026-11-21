@@ -110,6 +110,13 @@ enable_reminders: true
 default_reminder_timezone: America/Los_Angeles
 max_reminders_per_user: 25
 
+# Lets the bot generate images (via the generate_image tool) with an OpenAI-compatible images API,
+# attached to its reply. Remove this section to disable. `provider` is a key under `providers`.
+image_generation:
+  provider: meta
+  model: muse-image-1.0
+  max_per_message: 2
+
 
 # MCP server settings:
 
