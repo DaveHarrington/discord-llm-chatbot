@@ -26,6 +26,9 @@ logging.basicConfig(
 
 VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl")
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
+# Models that read PDFs natively (OpenAI-style "file" content parts; LiteLLM maps them to Claude/Gemini
+# document blocks). Other models get the PDF's extracted text instead.
+PDF_MODEL_TAGS = ("claude", "gemini", "gpt-4.1", "gpt-4o", "gpt-5", "o3", "o4")
 
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
@@ -439,6 +442,8 @@ def _chat_content_to_responses_input(content: Any) -> Any:
             parts.append({"type": "input_text", "text": part["text"]})
         elif part["type"] == "image_url":
             parts.append({"type": "input_image", "image_url": part["image_url"]["url"]})
+        elif part["type"] == "file":
+            parts.append({"type": "input_file", "filename": part["file"]["filename"], "file_data": part["file"]["file_data"]})
     return parts
 
 
@@ -539,10 +544,29 @@ async def responses_api_stream(
     return _fake_async_iter(_responses_output_to_chunks(response))
 
 
+
+def _is_pdf(att: discord.Attachment) -> bool:
+    return (att.content_type or "").startswith("application/pdf") or att.filename.lower().endswith(".pdf")
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    try:
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(data))
+        return "\n\n".join(f"--- Page {i} ---\n{text}" for i, page in enumerate(reader.pages, 1) if (text := (page.extract_text() or "").strip()))
+    except Exception:
+        logging.exception("Error extracting PDF text")
+        return ""
+
+
 @dataclass
 class MsgNode:
     text: Optional[str] = None
     images: list[dict[str, Any]] = field(default_factory=list)
+    pdfs: list[dict[str, Any]] = field(default_factory=list)  # {"filename", "data": bytes, "text": Optional[str]}
 
     role: Literal["user", "assistant"] = "assistant"
     user_id: Optional[int] = None
@@ -775,6 +799,8 @@ async def on_message(new_msg: discord.Message) -> None:
 
     max_text = config.get("max_text", 100000)
     max_images = config.get("max_images", 5) if accept_images else 0
+    accept_pdfs = any(x in provider_slash_model.lower() for x in PDF_MODEL_TAGS)
+    max_pdfs = config.get("max_pdfs", 3)
     max_messages = config.get("max_messages", 25)
 
     # Build message chain and set user warnings
@@ -789,14 +815,20 @@ async def on_message(new_msg: discord.Message) -> None:
             if curr_node.text == None:
                 cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
 
-                good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
+                max_pdf_bytes = int(config.get("max_pdf_mb", 10) * 1024 * 1024)
+                good_attachments = [
+                    att
+                    for att in curr_msg.attachments
+                    if att.content_type
+                    and (any(att.content_type.startswith(x) for x in ("text", "image")) or (_is_pdf(att) and att.size <= max_pdf_bytes))
+                ]
 
                 attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
 
                 curr_node.text = "\n".join(
                     ([cleaned_content] if cleaned_content else [])
                     + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
-                    + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
+                    + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text") and not _is_pdf(att)]
                 )
 
                 curr_node.images = [
@@ -804,6 +836,8 @@ async def on_message(new_msg: discord.Message) -> None:
                     for att, resp in zip(good_attachments, attachment_responses)
                     if att.content_type.startswith("image")
                 ]
+
+                curr_node.pdfs = [dict(filename=att.filename, data=resp.content, text=None) for att, resp in zip(good_attachments, attachment_responses) if _is_pdf(att)]
 
                 curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
 
@@ -834,10 +868,24 @@ async def on_message(new_msg: discord.Message) -> None:
                     logging.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
-            if curr_node.images[:max_images]:
-                content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
+            node_text = curr_node.text
+            pdf_parts = []
+            for pdf in curr_node.pdfs[:max_pdfs]:
+                if accept_pdfs:
+                    data_url = f"data:application/pdf;base64,{b64encode(pdf['data']).decode('utf-8')}"
+                    pdf_parts.append(dict(type="file", file=dict(filename=pdf["filename"], file_data=data_url)))
+                else:
+                    if pdf["text"] == None:
+                        pdf["text"] = await asyncio.to_thread(_extract_pdf_text, pdf["data"])
+                    if pdf["text"]:
+                        node_text = "\n\n".join(filter(None, (node_text, f"[Attached PDF: {pdf['filename']}]\n{pdf['text']}")))
+                    else:
+                        user_warnings.add(f"⚠️ Couldn't read text from {pdf['filename']}")
+
+            if curr_node.images[:max_images] or pdf_parts:
+                content = ([dict(type="text", text=node_text[:max_text])] if node_text[:max_text] else []) + curr_node.images[:max_images] + pdf_parts
             else:
-                content = curr_node.text[:max_text]
+                content = node_text[:max_text]
 
             if content != "":
                 message = dict(content=content, role=curr_node.role)
@@ -846,10 +894,12 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 messages.append(message)
 
-            if len(curr_node.text) > max_text:
+            if len(node_text) > max_text:
                 user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
             if len(curr_node.images) > max_images:
                 user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
+            if len(curr_node.pdfs) > max_pdfs:
+                user_warnings.add(f"⚠️ Max {max_pdfs} PDF{'' if max_pdfs == 1 else 's'} per message")
             if curr_node.has_bad_attachments:
                 user_warnings.add("⚠️ Unsupported attachments")
             if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
