@@ -480,18 +480,23 @@ def _responses_output_to_chunks(response: Any) -> list[SimpleNamespace]:
 
     text_parts = []
     citations = []
-    for item in response.output:
+    # The model can narrate between hosted web searches ("I'll search for...", "Found X...")
+    # as separate message items. Only keep the text after the last search, but keep every citation.
+    last_search_idx = max((i for i, item in enumerate(response.output) if getattr(item, "type", None) == "web_search_call"), default=-1)
+    for i, item in enumerate(response.output):
         if getattr(item, "type", None) != "message":
             continue
+        keep_text = i > last_search_idx
         for content_part in getattr(item, "content", None) or []:
             if getattr(content_part, "type", None) != "output_text":
                 continue
-            text_parts.append(content_part.text)
+            if keep_text:
+                text_parts.append(content_part.text)
             for ann in getattr(content_part, "annotations", None) or []:
                 if getattr(ann, "type", None) == "url_citation":
                     citations.append((ann.title, ann.url))
 
-    full_text = "".join(text_parts)
+    full_text = "\n\n".join(part.strip() for part in text_parts if part.strip())
     if citations:
         seen = set()
         lines = []
