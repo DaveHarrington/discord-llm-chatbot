@@ -28,7 +28,7 @@ VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "l
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 # Models that read PDFs natively (OpenAI-style "file" content parts; LiteLLM maps them to Claude/Gemini
 # document blocks). Other models get the PDF's extracted text instead.
-PDF_MODEL_TAGS = ("claude", "gemini", "gpt-4.1", "gpt-4o", "gpt-5", "o3", "o4")
+PDF_MODEL_TAGS = ("claude", "gemini", "muse", "gpt-4.1", "gpt-4o", "gpt-5", "o3", "o4")
 
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
