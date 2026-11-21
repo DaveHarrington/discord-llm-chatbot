@@ -4,5 +4,4 @@ httpx
 mcp>=2.0.0
 openai
 pytz
-pypdf
 pyyaml
