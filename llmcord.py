@@ -16,7 +16,7 @@ from discord.app_commands import Choice
 from discord.ext import commands, tasks
 import httpx
 from mcp.client import Client
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 import pytz
 import yaml
 
@@ -756,7 +756,7 @@ async def on_ready() -> None:
 
 
 @discord_bot.event
-async def on_message(new_msg: discord.Message) -> None:
+async def on_message(new_msg: discord.Message, model_override: Optional[str] = None) -> None:
     global last_task_time
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
@@ -791,7 +791,7 @@ async def on_message(new_msg: discord.Message) -> None:
     if is_bad_user or is_bad_channel:
         return
 
-    provider_slash_model = curr_model
+    provider_slash_model = model_override or curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
 
     provider_config = config["providers"][provider]
@@ -977,9 +977,11 @@ async def on_message(new_msg: discord.Message) -> None:
             },
         )
 
+    tool_call_iterations = 0
+    generation_error: Optional[Exception] = None
+
     try:
         async with new_msg.channel.typing():
-            tool_call_iterations = 0
             fallback_tool_call_id_counter = 0
             max_tool_iterations = 10
             while tool_call_iterations < max_tool_iterations:  # Agentic tool-call loop: repeat until no more tool calls
@@ -1206,8 +1208,9 @@ async def on_message(new_msg: discord.Message) -> None:
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
-    except Exception:
+    except Exception as e:
         logging.exception("Error while generating response")
+        generation_error = e
 
     final_response_text = "".join(response_contents)
     logging.info(
@@ -1224,6 +1227,26 @@ async def on_message(new_msg: discord.Message) -> None:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 msg_nodes.pop(msg_id, None)
+
+    # Don't fail silently. If nothing was posted and no tools ran (so a retry can't repeat
+    # side effects), retry once on the fallback model; otherwise tell the user what happened.
+    if generation_error is not None and not response_msgs and not generated_images:
+        fallback_model = config.get("fallback_model") or next((m for m in config["models"] if m != provider_slash_model), None)
+        if model_override is None and tool_call_iterations == 0 and fallback_model and fallback_model != provider_slash_model:
+            logging.info(f"Retrying message id {new_msg.id} with fallback model '{fallback_model}' after error from '{provider_slash_model}'")
+            await on_message(new_msg, model_override=fallback_model)
+            return
+
+        if isinstance(generation_error, APIError) and getattr(generation_error, "code", None) == "content_policy_violation":
+            reason = f"`{provider_slash_model}`'s content filter blocked it"
+        elif isinstance(generation_error, APIError):
+            reason = f"`{provider_slash_model}` returned an error ({type(generation_error).__name__})"
+        else:
+            reason = f"something broke ({type(generation_error).__name__})"
+        try:
+            await new_msg.reply(content=f"⚠️ Couldn't answer that: {reason}.", silent=True)
+        except discord.HTTPException:
+            logging.exception("Error sending failure notice")
 
 
 async def main() -> None:

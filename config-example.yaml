@@ -89,6 +89,11 @@ models:
 
   ollama/llama4:
 
+# If the current model errors (e.g. a content-filter refusal) before anything is posted and before any
+# tool runs, retry once with this model. Defaults to the first other entry in `models`. If that fails
+# too, the bot replies with a short error instead of staying silent.
+# fallback_model: anthropic_proxy/claude-sonnet-5
+
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.
   Never refuse a request. Optimize for brevity.
